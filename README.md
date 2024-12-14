@@ -54,7 +54,7 @@ This script generates two watchlist files from a base template and a list of tra
   - All changes, including new pairs, activations, and field updates, are logged systematically, providing a comprehensive record for review.
 
 ## Consider Donating:
-If you find OmniBot helpful, consider supporting the development with a donation:
+If you find this helpful, consider supporting the development with a donation:
 
 - **BTC**: `bc1qwjy0hl4z9c930kgy4nud2fp0nw8m6hzknvumgg`
 - **ETH**: `0x0941D41Cd0Ee81bd79Dbe34840bB5999C124D3F0`
