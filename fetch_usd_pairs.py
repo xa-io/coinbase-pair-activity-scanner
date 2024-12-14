@@ -15,11 +15,10 @@ DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
 mentionrole = os.getenv('MENTION_ROLE')
 
 # Directory where the script and files are located
-# This will automatically point to the directory where the script is being executed
 script_dir = os.path.dirname(os.path.realpath(__file__))
+pairs_file_path = os.path.join(script_dir, "pairs.txt")
+fields_status_file_path = os.path.join(script_dir, "fields_status.txt")
 
-# Function to send a notification to Discord
-# This function takes the content (text) to be sent to Discord and posts it to the webhook URL
 def send_discord_notification(content):
     if content.strip():
         data = {"content": content}
@@ -29,11 +28,18 @@ def send_discord_notification(content):
         else:
             print(f"Failed to send Discord notification. Status code: {response.status_code}")
 
-# Function to fetch all trading pairs from Coinbase Pro API
-# It filters the pairs to only include those quoted in USD, and then separates them into traded and disabled pairs
+def normalize_value(value):
+    value = value.strip()
+    # Replace fancy quotes with standard ones
+    value = value.replace('’', "'")
+    value = value.replace('\u200b', '') 
+    value = value.replace('“', '"').replace('”', '"')
+    # Add more replacements if you notice other special characters
+    return value
+
 def fetch_usd_pairs():
     start_time = time.time()  # Start measuring time
-    url = "https://api.pro.coinbase.com/products"  # Coinbase Pro API endpoint to fetch product data
+    url = "https://api.exchange.coinbase.com/products"
     
     try:
         response = requests.get(url)
@@ -45,19 +51,18 @@ def fetch_usd_pairs():
     products = response.json()
     
     # Filter out only USD pairs
-    usd_pairs = [product for product in products if product['quote_currency'] == 'USD']
+    usd_pairs = [product for product in products if product.get('quote_currency') == 'USD']
     
     # Separate traded and disabled pairs
     traded_pairs = sorted([pair['id'] for pair in usd_pairs if not pair['trading_disabled']])
     disabled_pairs = sorted([pair['id'] for pair in usd_pairs if pair['trading_disabled']])
+    current_traded_pairs = set(traded_pairs)
+    current_disabled_pairs = set(disabled_pairs)
     
     # Load previously saved pairs if the file exists
     previous_traded_pairs = set()
     previous_disabled_pairs = set()
     fields_status = {}
-    pairs_file_path = os.path.join(script_dir, "pairs.txt")
-    fields_status_file_path = os.path.join(script_dir, "fields_status.txt")
-
     try:
         with open(pairs_file_path, "r") as file:
             lines = file.readlines()
@@ -80,26 +85,45 @@ def fetch_usd_pairs():
     except FileNotFoundError:
         print("pairs.txt not found, creating a new one.")
     
+    # Now read fields_status_file_path
     try:
         with open(fields_status_file_path, "r") as file:
             for line in file:
                 pair_id, statuses_str = line.strip().split(":", 1)
-                fields_status[pair_id] = dict(field.split("=") for field in statuses_str.split(",") if "=" in field)
+                fields_status[pair_id] = {}
+                for entry in [f.strip() for f in statuses_str.split(",") if "=" in f]:
+                    k, v = entry.split("=", 1)
+                    k = k.strip()
+                    v = normalize_value(v.strip())  # Normalize the value read from the file
+                    fields_status[pair_id][k] = v
     except FileNotFoundError:
         print("fields_status.txt not found, creating a new one.")
-    
-    # Get the current pairs and field statuses
-    current_traded_pairs = set(traded_pairs)
-    current_disabled_pairs = set(disabled_pairs)
+
+    # If no baseline exists yet, we can't detect changes. We'll create a baseline after building current_fields_status.
+    if not fields_status:
+        field_changes = {}
+    else:
+        field_changes = {}
+
+    # Now define current_fields_status
     current_fields_status = {pair['id']: {
-        'post_only': str(pair['post_only']),
-        'limit_only': str(pair['limit_only']),
-        'cancel_only': str(pair['cancel_only']),
-        'status': str(pair['status']),
-        'status_message': str(pair['status_message']),
-        'trading_disabled': str(pair['trading_disabled']),
-        'auction_mode': str(pair['auction_mode'])
+        'post_only': 'true' if pair.get('post_only', False) else 'false',
+        'limit_only': 'true' if pair.get('limit_only', False) else 'false',
+        'cancel_only': 'true' if pair.get('cancel_only', False) else 'false',
+        'trading_disabled': 'true' if pair.get('trading_disabled', False) else 'false',
+        'auction_mode': 'true' if pair.get('auction_mode', False) else 'false',
+        'status': normalize_value(str(pair.get('status', ''))),
+        # 'status_message': normalize_value(str(pair.get('status_message', '')))  # Disabled because this is annoying and spams several times over
     } for pair in usd_pairs}
+
+    # If no baseline (fields_status empty), create it
+    if not fields_status:
+        sorted_pairs = sorted(current_fields_status.items())
+        with open(fields_status_file_path, "w") as file:
+            for pair_id, statuses in sorted_pairs:
+                file.write(f"{pair_id}:{','.join(f'{k}={v}' for k, v in statuses.items())}\n")
+        print("fields_status.txt baseline created because no previous baseline existed.")
+        fields_status = {pair_id: dict(statuses) for pair_id, statuses in sorted_pairs}
     
     # Find new pairs
     previous_pairs = previous_traded_pairs | previous_disabled_pairs
@@ -110,16 +134,29 @@ def fetch_usd_pairs():
     moved_to_traded = previous_disabled_pairs & current_traded_pairs
     moved_to_disabled = previous_traded_pairs & current_disabled_pairs
 
-    # Detect changes in specified fields (e.g., post_only, limit_only, etc.)
+    # Detect changes in specified fields (only one block for this)
     field_changes = {}
     for pair_id, statuses in current_fields_status.items():
         previous_statuses = fields_status.get(pair_id, {})
-        changes = {field: statuses[field] for field in statuses if statuses[field] != previous_statuses.get(field, None)}
-        if changes:
-            field_changes[pair_id] = changes
+        if not previous_statuses:
+            continue
 
-    # Ensure pairs.txt and TV-Coinbase-Watchlist.txt are created and updated on the first run or when new pairs are found
-    # These files store the traded pairs and the corresponding TradingView watchlist format
+        changes = {field: statuses[field] for field in statuses if statuses[field] != previous_statuses.get(field, None)}
+        
+        # # Debug prints: show exactly what changed - Disabled as well to save console from being flooded
+        # print("DEBUG Changes Detected for:", pair_id)
+        # for field in changes:
+        #     old_val = previous_statuses.get(field, None)
+        #     new_val = statuses[field]
+        #     print(f"DEBUG Field: {field}")
+        #     print(f"DEBUG Old: {repr(old_val)}")
+        #     print(f"DEBUG New: {repr(new_val)}")
+
+        if not changes:
+            continue
+        field_changes[pair_id] = changes
+
+    # Ensure pairs.txt and TV-Coinbase-Watchlist.txt are created/updated if needed
     tv_watchlist_file_path = os.path.join(script_dir, "TV-Coinbase-Watchlist.txt")
     if not os.path.exists(pairs_file_path) or not os.path.exists(tv_watchlist_file_path) or new_pairs or moved_to_traded or moved_to_disabled or field_changes:
         with open(pairs_file_path, "w") as file:
@@ -136,8 +173,7 @@ def fetch_usd_pairs():
                 file.write(f"COINBASE:{pair.replace('-', '')},\n")
         print("TV-Coinbase-Watchlist.txt has been updated.")
         
-    # Only update active_pairs.txt if changes occurred
-    # This file stores all traded pairs with the '-USD' suffix
+    # Update active_pairs.txt if needed
     active_pairs_file_path = os.path.join(script_dir, "active_pairs.txt")
     previous_active_pairs = set()
     try:
@@ -146,7 +182,6 @@ def fetch_usd_pairs():
     except FileNotFoundError:
         print("active_pairs.txt not found, creating a new one.")
 
-    # Keep the '-USD' suffix and sort pairs alphabetically
     current_active_pairs = sorted(traded_pairs)
     if set(current_active_pairs) != previous_active_pairs:
         with open(active_pairs_file_path, "w") as file:
@@ -154,8 +189,7 @@ def fetch_usd_pairs():
                 file.write(pair + "\n")
         print("active_pairs.txt has been updated with traded pairs sorted alphabetically.")
 
-    # Update active_pairs_no_usd.txt similarly to active_pairs.txt but without the '-USD' suffix
-    # This file stores the traded pairs without the '-USD' suffix, useful for certain applications
+    # Update active_pairs_no_usd.txt if needed
     active_pairs_no_usd_file_path = os.path.join(script_dir, "active_pairs_no_usd.txt")
     previous_active_pairs_no_usd = set()
     try:
@@ -164,7 +198,6 @@ def fetch_usd_pairs():
     except FileNotFoundError:
         print("active_pairs_no_usd.txt not found, creating a new one.")
 
-    # Remove '-USD' from each traded pair and sort them alphabetically
     current_active_pairs_no_usd = sorted(pair.replace('-USD', '') for pair in traded_pairs)
     if set(current_active_pairs_no_usd) != previous_active_pairs_no_usd:
         with open(active_pairs_no_usd_file_path, "w") as file:
@@ -172,8 +205,7 @@ def fetch_usd_pairs():
                 file.write(pair + "\n")
         print("active_pairs_no_usd.txt has been updated with traded pairs without the '-USD' suffix.")
 
-    # Save new pairs with the date they were found to new_pairs.txt
-    # This helps in keeping track of when new pairs are introduced
+    # Handle new pairs
     new_pairs_file_path = os.path.join(script_dir, "new_pairs.txt")
     if new_pairs:
         with open(new_pairs_file_path, "a") as file:
@@ -188,8 +220,7 @@ def fetch_usd_pairs():
         send_discord_notification(content)
         print("new_pairs.txt has been updated with new pairs.")
     
-    # Log and notify about pairs moving between traded and disabled
-    # This logs the pairs that have been enabled or disabled and notifies via Discord
+    # Handle activations (moved_to_traded or moved_to_disabled)
     activations_file_path = os.path.join(script_dir, "activations.txt")
     if moved_to_traded or moved_to_disabled:
         content = ""
@@ -208,15 +239,13 @@ def fetch_usd_pairs():
             send_discord_notification(content)
         print("activations.txt has been updated with changes in pair status.")
     
-    # Log and notify about changes in specified fields
-    # This section detects changes in fields like 'post_only', 'limit_only', etc., and notifies via Discord
+    # Handle field_changes
     field_changes_file_path = os.path.join(script_dir, "field_changes.txt")
-    fields_status_file_path = os.path.join(script_dir, "fields_status.txt")
     if field_changes:
         content = ""
         with open(field_changes_file_path, "a") as file:
-            for pair_id, changes in field_changes.items():
-                for field, value in changes.items():
+            for pair_id, changes_dict in field_changes.items():
+                for field, value in changes_dict.items():
                     if field == 'status_message' and value == "":
                         continue  # Skip notification for blank status_message
                     log = f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {pair_id} {field} changed to {value}\n"
@@ -244,7 +273,6 @@ def fetch_usd_pairs():
             print("Discord notification sent successfully.")
 
         # Update the fields_status file with the current statuses to prevent repeated notifications
-        # Alphabetize by pair_id for consistency
         sorted_pairs = sorted(current_fields_status.items())
         with open(fields_status_file_path, "w") as file:
             for pair_id, statuses in sorted_pairs:
@@ -268,15 +296,14 @@ def fetch_usd_pairs():
                 print(f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {pair}")
         if field_changes:
             print("Field changes:")
-            for pair_id, changes in field_changes.items():
-                for field, value in changes.items():
+            for pair_id, changes_dict in field_changes.items():
+                for field, value in changes_dict.items():
                     print(f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {pair_id} {field} changed to {value}")
     else:
         print(f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {elapsed_time:.2f} ms - No new pairs found this scan.")
 
-# Main loop: The script continuously runs and fetches USD pairs from Coinbase Pro API every 2 seconds
 if __name__ == "__main__":
     fetch_usd_pairs()  # Ensure the files are created/updated on the first run
     while True:
         fetch_usd_pairs()
-        time.sleep(2)  # Wait for 2 seconds before running again
+        time.sleep(10)  # Wait before running again
