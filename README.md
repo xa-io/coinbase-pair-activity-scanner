@@ -109,6 +109,8 @@ The script now persists only the last alerted `status_message` (after normalizat
 - **Overall Stability Improvements:**  
 Minor code refactoring and cleanup were performed to reduce unnecessary memory usage and improve performance during long-term execution.
 
+## Features
+
 - **Optimized Baseline Creation**  
   - On the first run, the script automatically creates a baseline for tracking changes in fields like `post_only`, `limit_only`, `cancel_only`, and more. This ensures efficient and accurate detection of future updates.
 
