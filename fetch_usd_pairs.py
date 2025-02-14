@@ -1,44 +1,112 @@
 import os
-from datetime import datetime
+import re
 import time
+import json
 import requests
+from datetime import datetime
 from dotenv import load_dotenv
 
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
+DEBUG_MODE = False  # Set to True to enable extra [DEBUG] prints
+ALERTED_FIELDS_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "alerted_fields.json")
+# ---------------------------------------------------------------------
+
 # Load environment variables from .env file
-# Ensure you have a .env file in the same directory as this script with the following variables:
-# DISCORD_WEBHOOK_URL: The webhook URL to send notifications to Discord
-# MENTION_ROLE: The role to mention in Discord when sending notifications (e.g., @everyone or a specific role ID)
 load_dotenv()
 
 # Your Discord webhook URL and role mention
 DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
-mentionrole = os.getenv('MENTION_ROLE')
+MENTION_ROLE = os.getenv('MENTION_ROLE')
 
-# Directory where the script and files are located
+# Files used by the script
 script_dir = os.path.dirname(os.path.realpath(__file__))
 pairs_file_path = os.path.join(script_dir, "pairs.txt")
 fields_status_file_path = os.path.join(script_dir, "fields_status.txt")
 
 def send_discord_notification(content):
+    """Sends a notification to Discord using the provided webhook URL."""
     if content.strip():
         data = {"content": content}
-        response = requests.post(DISCORD_WEBHOOK_URL, json=data)
-        if response.status_code == 204:
-            print("Discord notification sent successfully.")
-        else:
-            print(f"Failed to send Discord notification. Status code: {response.status_code}")
+        try:
+            response = requests.post(DISCORD_WEBHOOK_URL, json=data)
+            if response.status_code == 204:
+                print("Discord notification sent successfully.")
+            else:
+                print(f"Failed to send Discord notification. Status code: {response.status_code}")
+        except Exception as e:
+            print(f"Error sending Discord notification: {e}")
 
-def normalize_value(value):
+def robust_normalize_value(value):
+    """
+    Normalizes a value by stripping whitespace, replacing fancy quotes/zero-width characters,
+    and collapsing multiple spaces into one.
+    """
     value = value.strip()
-    # Replace fancy quotes with standard ones
-    value = value.replace('’', "'")
-    value = value.replace('\u200b', '') 
+    value = value.replace('’', "'").replace('\u200b', '')
     value = value.replace('“', '"').replace('”', '"')
-    # Add more replacements if you notice other special characters
+    value = re.sub(r'\s+', ' ', value)
     return value
 
+def normalize_status_message(value):
+    """
+    Further normalizes a status message by applying robust normalization and then
+    replacing commas with periods so that messages with a comma or period are treated equally.
+    """
+    norm_val = robust_normalize_value(value)
+    norm_val = norm_val.replace(",", ".")
+    return norm_val
+
+def load_baseline(filename):
+    """Loads the baseline from a file into a dictionary."""
+    baseline = {}
+    try:
+        with open(filename, "r") as file:
+            for line in file:
+                if ':' not in line:
+                    continue
+                pair_id, statuses_str = line.strip().split(":", 1)
+                baseline[pair_id] = {}
+                for entry in statuses_str.split(","):
+                    if "=" in entry:
+                        k, v = entry.split("=", 1)
+                        baseline[pair_id][k.strip()] = robust_normalize_value(v.strip())
+    except FileNotFoundError:
+        if DEBUG_MODE:
+            print("[DEBUG] Baseline file not found, will create a new one.")
+    return baseline
+
+def save_baseline(baseline, filename):
+    """Saves the baseline dictionary to a file."""
+    with open(filename, "w") as file:
+        for pair_id, statuses in sorted(baseline.items()):
+            line = f"{pair_id}:{','.join(f'{k}={v}' for k, v in statuses.items())}\n"
+            file.write(line)
+
+def load_alerted_fields(filename):
+    """Loads the persistent alerted fields (for status_message only) from a JSON file."""
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"[DEBUG] Error loading alerted fields: {e}")
+    return {}
+
+def save_alerted_fields(alerted, filename):
+    """Saves the persistent alerted fields (for status_message only) to a JSON file."""
+    try:
+        with open(filename, "w") as f:
+            json.dump(alerted, f)
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"[DEBUG] Error saving alerted fields: {e}")
+
 def fetch_usd_pairs():
-    start_time = time.time()  # Start measuring time
+    """Fetches USD pairs, detects changes, updates local files, and sends Discord notifications if needed."""
+    start_time = time.time()
     url = "https://api.exchange.coinbase.com/products"
     
     try:
@@ -47,22 +115,23 @@ def fetch_usd_pairs():
     except requests.exceptions.RequestException as e:
         print(f"Error fetching data from Coinbase Pro API: {e}")
         return
-    
+
     products = response.json()
-    
-    # Filter out only USD pairs
-    usd_pairs = [product for product in products if product.get('quote_currency') == 'USD']
-    
-    # Separate traded and disabled pairs
-    traded_pairs = sorted([pair['id'] for pair in usd_pairs if not pair['trading_disabled']])
-    disabled_pairs = sorted([pair['id'] for pair in usd_pairs if pair['trading_disabled']])
+    if DEBUG_MODE:
+        print(f"[DEBUG] Fetched {len(products)} total products.")
+
+    usd_pairs = [p for p in products if p.get('quote_currency') == 'USD']
+    if DEBUG_MODE:
+        print(f"[DEBUG] Filtered down to {len(usd_pairs)} USD pairs.")
+
+    traded_pairs = sorted([p['id'] for p in usd_pairs if not p.get('trading_disabled', False)])
+    disabled_pairs = sorted([p['id'] for p in usd_pairs if p.get('trading_disabled', False)])
     current_traded_pairs = set(traded_pairs)
     current_disabled_pairs = set(disabled_pairs)
-    
-    # Load previously saved pairs if the file exists
+
+    # Load previously saved pairs from pairs.txt.
     previous_traded_pairs = set()
     previous_disabled_pairs = set()
-    fields_status = {}
     try:
         with open(pairs_file_path, "r") as file:
             lines = file.readlines()
@@ -77,88 +146,73 @@ def fetch_usd_pairs():
                     traded_section = False
                     disabled_section = True
                     continue
-                
                 if traded_section and line.strip():
                     previous_traded_pairs.add(line.strip())
                 if disabled_section and line.strip():
                     previous_disabled_pairs.add(line.strip())
     except FileNotFoundError:
-        print("pairs.txt not found, creating a new one.")
-    
-    # Now read fields_status_file_path
-    try:
-        with open(fields_status_file_path, "r") as file:
-            for line in file:
-                pair_id, statuses_str = line.strip().split(":", 1)
-                fields_status[pair_id] = {}
-                for entry in [f.strip() for f in statuses_str.split(",") if "=" in f]:
-                    k, v = entry.split("=", 1)
-                    k = k.strip()
-                    v = normalize_value(v.strip())  # Normalize the value read from the file
-                    fields_status[pair_id][k] = v
-    except FileNotFoundError:
-        print("fields_status.txt not found, creating a new one.")
+        if DEBUG_MODE:
+            print("[DEBUG] pairs.txt not found, will create a new one.")
 
-    # If no baseline exists yet, we can't detect changes. We'll create a baseline after building current_fields_status.
-    if not fields_status:
-        field_changes = {}
-    else:
-        field_changes = {}
+    baseline = load_baseline(fields_status_file_path)
+    alerted_fields = load_alerted_fields(ALERTED_FIELDS_FILE)
 
-    # Now define current_fields_status
-    current_fields_status = {pair['id']: {
-        'post_only': 'true' if pair.get('post_only', False) else 'false',
-        'limit_only': 'true' if pair.get('limit_only', False) else 'false',
-        'cancel_only': 'true' if pair.get('cancel_only', False) else 'false',
-        'trading_disabled': 'true' if pair.get('trading_disabled', False) else 'false',
-        'auction_mode': 'true' if pair.get('auction_mode', False) else 'false',
-        'status': normalize_value(str(pair.get('status', ''))),
-        # 'status_message': normalize_value(str(pair.get('status_message', '')))  # Disabled because this is annoying and spams several times over
-    } for pair in usd_pairs}
+    # Build current fields status from API data.
+    current_fields_status = {}
+    for p in usd_pairs:
+        pair_id = p.get('id', '')
+        current_fields_status[pair_id] = {
+            'post_only': 'true' if p.get('post_only', False) else 'false',
+            'limit_only': 'true' if p.get('limit_only', False) else 'false',
+            'cancel_only': 'true' if p.get('cancel_only', False) else 'false',
+            'trading_disabled': 'true' if p.get('trading_disabled', False) else 'false',
+            'auction_mode': 'true' if p.get('auction_mode', False) else 'false',
+            'status': robust_normalize_value(str(p.get('status', ''))),
+            'status_message': robust_normalize_value(str(p.get('status_message', '')))
+        }
 
-    # If no baseline (fields_status empty), create it
-    if not fields_status:
-        sorted_pairs = sorted(current_fields_status.items())
-        with open(fields_status_file_path, "w") as file:
-            for pair_id, statuses in sorted_pairs:
-                file.write(f"{pair_id}:{','.join(f'{k}={v}' for k, v in statuses.items())}\n")
-        print("fields_status.txt baseline created because no previous baseline existed.")
-        fields_status = {pair_id: dict(statuses) for pair_id, statuses in sorted_pairs}
-    
-    # Find new pairs
-    previous_pairs = previous_traded_pairs | previous_disabled_pairs
-    current_pairs = current_traded_pairs | current_disabled_pairs
-    new_pairs = current_pairs - previous_pairs
+    # If no baseline exists, save current as baseline and exit.
+    if not baseline:
+        save_baseline(current_fields_status, fields_status_file_path)
+        save_alerted_fields(alerted_fields, ALERTED_FIELDS_FILE)
+        print("Baseline created in fields_status.txt; no alerts on first run.")
+        return
 
-    # Detect changes between traded and disabled pairs
+    # Determine field changes.
+    field_changes = {}
+    for pair_id, current_vals in current_fields_status.items():
+        if pair_id not in baseline:
+            field_changes[pair_id] = current_vals.copy()
+        else:
+            changes = {}
+            for field in ['post_only','limit_only','cancel_only','status','status_message','trading_disabled','auction_mode']:
+                if field == 'status_message':
+                    current_val = normalize_status_message(current_vals.get(field, ''))
+                    baseline_val = normalize_status_message(baseline.get(pair_id, {}).get(field, ''))
+                else:
+                    current_val = robust_normalize_value(current_vals.get(field, ''))
+                    baseline_val = robust_normalize_value(baseline.get(pair_id, {}).get(field, ''))
+                if current_val != baseline_val:
+                    changes[field] = current_val
+            if changes:
+                field_changes[pair_id] = changes
+
+    # Determine if pairs have changed from disabled <--> traded.
+    new_pairs = (current_traded_pairs | current_disabled_pairs) - (previous_traded_pairs | previous_disabled_pairs)
     moved_to_traded = previous_disabled_pairs & current_traded_pairs
     moved_to_disabled = previous_traded_pairs & current_disabled_pairs
 
-    # Detect changes in specified fields (only one block for this)
-    field_changes = {}
-    for pair_id, statuses in current_fields_status.items():
-        previous_statuses = fields_status.get(pair_id, {})
-        if not previous_statuses:
-            continue
+    # We'll track if we actually wrote pairs.txt or watchlist so we don't spam the console.
+    wrote_pairs_txt = False
+    wrote_watchlist_txt = False
 
-        changes = {field: statuses[field] for field in statuses if statuses[field] != previous_statuses.get(field, None)}
-        
-        # # Debug prints: show exactly what changed - Disabled as well to save console from being flooded
-        # print("DEBUG Changes Detected for:", pair_id)
-        # for field in changes:
-        #     old_val = previous_statuses.get(field, None)
-        #     new_val = statuses[field]
-        #     print(f"DEBUG Field: {field}")
-        #     print(f"DEBUG Old: {repr(old_val)}")
-        #     print(f"DEBUG New: {repr(new_val)}")
-
-        if not changes:
-            continue
-        field_changes[pair_id] = changes
-
-    # Ensure pairs.txt and TV-Coinbase-Watchlist.txt are created/updated if needed
+    # Update pairs.txt and TV-Coinbase-Watchlist.txt only if something actually changed.
+    need_update_pairs_files = (
+        new_pairs or moved_to_traded or moved_to_disabled or field_changes
+        or not os.path.exists(pairs_file_path)
+    )
     tv_watchlist_file_path = os.path.join(script_dir, "TV-Coinbase-Watchlist.txt")
-    if not os.path.exists(pairs_file_path) or not os.path.exists(tv_watchlist_file_path) or new_pairs or moved_to_traded or moved_to_disabled or field_changes:
+    if need_update_pairs_files:
         with open(pairs_file_path, "w") as file:
             file.write("Traded Pairs:\n")
             for pair in traded_pairs:
@@ -166,144 +220,161 @@ def fetch_usd_pairs():
             file.write("\nDisabled Pairs:\n")
             for pair in disabled_pairs:
                 file.write(pair + "\n")
-        print("pairs.txt has been updated.")
-        
+        wrote_pairs_txt = True
+
+        # Update watchlist if needed.
         with open(tv_watchlist_file_path, "w") as file:
             for pair in traded_pairs:
                 file.write(f"COINBASE:{pair.replace('-', '')},\n")
-        print("TV-Coinbase-Watchlist.txt has been updated.")
-        
-    # Update active_pairs.txt if needed
-    active_pairs_file_path = os.path.join(script_dir, "active_pairs.txt")
-    previous_active_pairs = set()
-    try:
-        with open(active_pairs_file_path, "r") as file:
-            previous_active_pairs = set(file.read().splitlines())
-    except FileNotFoundError:
-        print("active_pairs.txt not found, creating a new one.")
+        wrote_watchlist_txt = True
 
-    current_active_pairs = sorted(traded_pairs)
-    if set(current_active_pairs) != previous_active_pairs:
-        with open(active_pairs_file_path, "w") as file:
-            for pair in current_active_pairs:
-                file.write(pair + "\n")
-        print("active_pairs.txt has been updated with traded pairs sorted alphabetically.")
+    # Update baseline if changed or new pairs or anything relevant.
+    # Actually, we do this after we decide if we have changes or not.
 
-    # Update active_pairs_no_usd.txt if needed
-    active_pairs_no_usd_file_path = os.path.join(script_dir, "active_pairs_no_usd.txt")
-    previous_active_pairs_no_usd = set()
-    try:
-        with open(active_pairs_no_usd_file_path, "r") as file:
-            previous_active_pairs_no_usd = set(file.read().splitlines())
-    except FileNotFoundError:
-        print("active_pairs_no_usd.txt not found, creating a new one.")
+    # (Optional) If you have an active_pairs.txt or active_pairs_no_usd.txt, handle them similarly.
 
-    current_active_pairs_no_usd = sorted(pair.replace('-USD', '') for pair in traded_pairs)
-    if set(current_active_pairs_no_usd) != previous_active_pairs_no_usd:
-        with open(active_pairs_no_usd_file_path, "w") as file:
-            for pair in current_active_pairs_no_usd:
-                file.write(pair + "\n")
-        print("active_pairs_no_usd.txt has been updated with traded pairs without the '-USD' suffix.")
-
-    # Handle new pairs
-    new_pairs_file_path = os.path.join(script_dir, "new_pairs.txt")
+    # Handle notifications for new pairs.
+    content_for_new_pairs = ""
     if new_pairs:
+        new_pairs_file_path = os.path.join(script_dir, "new_pairs.txt")
         with open(new_pairs_file_path, "a") as file:
             for pair in new_pairs:
                 file.write(f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {pair}\n")
-        content = ""
+
         for pair in new_pairs:
             if pair in traded_pairs:
-                content += f"{mentionrole} [Enabled] {pair} has been detected.\n<https://www.coinbase.com/advanced-trade/spot/{pair}>\n"
+                content_for_new_pairs += f"{MENTION_ROLE} [Enabled] {pair} has been detected.\n<https://www.coinbase.com/advanced-trade/spot/{pair}>\n"
             else:
-                content += f"{mentionrole} [Disabled] {pair} has been detected.\n"
-        send_discord_notification(content)
-        print("new_pairs.txt has been updated with new pairs.")
-    
-    # Handle activations (moved_to_traded or moved_to_disabled)
-    activations_file_path = os.path.join(script_dir, "activations.txt")
+                content_for_new_pairs += f"{MENTION_ROLE} [Disabled] {pair} has been detected.\n"
+
+        send_discord_notification(content_for_new_pairs)
+
+    # Handle activations (moved_to_traded or moved_to_disabled).
+    content_for_activations = ""
     if moved_to_traded or moved_to_disabled:
-        content = ""
+        activations_file_path = os.path.join(script_dir, "activations.txt")
         with open(activations_file_path, "a") as file:
             if moved_to_traded:
                 for pair in moved_to_traded:
                     log = f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {pair} has been enabled\n"
                     file.write(log)
-                    content += f"{mentionrole} {pair} trading has been enabled.\n<https://www.coinbase.com/advanced-trade/spot/{pair}>\n"
+                    content_for_activations += f"{MENTION_ROLE} {pair} trading has been enabled.\n<https://www.coinbase.com/advanced-trade/spot/{pair}>\n"
             if moved_to_disabled:
                 for pair in moved_to_disabled:
                     log = f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {pair} has been disabled\n"
                     file.write(log)
-                    content += f"{mentionrole} {pair} trading has been disabled.\n"
-        if content:
-            send_discord_notification(content)
-        print("activations.txt has been updated with changes in pair status.")
-    
-    # Handle field_changes
+                    content_for_activations += f"{MENTION_ROLE} {pair} trading has been disabled.\n"
+
+        send_discord_notification(content_for_activations)
+
+    # --- Handle field_changes notifications ---
+    notification_content = ""
     field_changes_file_path = os.path.join(script_dir, "field_changes.txt")
+    changes_occurred = False  # track if *any* real changes occurred
+
     if field_changes:
-        content = ""
         with open(field_changes_file_path, "a") as file:
             for pair_id, changes_dict in field_changes.items():
-                for field, value in changes_dict.items():
-                    if field == 'status_message' and value == "":
-                        continue  # Skip notification for blank status_message
-                    log = f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {pair_id} {field} changed to {value}\n"
-                    file.write(log)
-                    if field in ['post_only', 'limit_only', 'cancel_only']:
-                        content += f"{mentionrole} {pair_id} {field.replace('_', ' ')} has been {'enabled' if value == 'true' else 'disabled'}.\n<https://www.coinbase.com/advanced-trade/spot/{pair_id}>\n"
+                for field, new_value in changes_dict.items():
+                    # Skip empty status_message.
+                    if field == 'status_message' and not new_value:
+                        continue
+
+                    changes_occurred = True
+                    if field == 'status_message':
+                        norm_new_value = normalize_status_message(new_value)
+                        alerted_val = alerted_fields.get(pair_id, {}).get('status_message', '')
+                        if norm_new_value == alerted_val:
+                            # Already alerted this exact status_message
+                            continue
+                    else:
+                        norm_new_value = robust_normalize_value(new_value)
+
+                    log_line = f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {pair_id} {field} changed to {norm_new_value}\n"
+                    file.write(log_line)
+
+                    # Build Discord message using Markdown link formatting.
+                    link = f"[{pair_id}](<https://www.coinbase.com/advanced-trade/spot/{pair_id}-USD>)"
+                    if field in ['post_only','limit_only','cancel_only']:
+                        status = 'enabled' if norm_new_value == 'true' else 'disabled'
+                        description = f"{field.replace('_', ' ')} has been {status}"
                     elif field == 'status':
-                        if value == 'online':
-                            content += f"{mentionrole} {pair_id} is now online\n<https://www.coinbase.com/advanced-trade/spot/{pair_id}>\n"
+                        if norm_new_value.lower() == 'online':
+                            description = "is now online"
                         else:
-                            content += f"{mentionrole} {pair_id} is now {value}.\n"
+                            description = f"status changed to {norm_new_value}"
                     elif field == 'status_message':
-                        content += f"{mentionrole} {pair_id} status updated: {value}.\n<https://www.coinbase.com/advanced-trade/spot/{pair_id}>\n"
+                        description = f"status updated: {norm_new_value}"
                     elif field == 'trading_disabled':
-                        if value.lower() == 'true':
-                            content += f"{mentionrole} {pair_id} trading has been disabled.\n"
+                        if norm_new_value.lower() == 'true':
+                            description = "trading has been disabled"
                         else:
-                            content += f"{mentionrole} {pair_id} trading has been enabled.\n<https://www.coinbase.com/advanced-trade/spot/{pair_id}>\n"
+                            description = "trading has been enabled"
                     elif field == 'auction_mode':
-                        content += f"{mentionrole} {pair_id} auction mode has {'started' if value == 'true' else 'ended'}.\n<https://www.coinbase.com/advanced-trade/spot/{pair_id}>\n"
+                        auction_status = 'started' if norm_new_value.lower() == 'true' else 'ended'
+                        description = f"auction mode has {auction_status}"
+                    # Append the formatted message.
+                    notification_content += f"{MENTION_ROLE} {link} - {description}\n"
 
-        if content:  # Only send notification if there's content
-            send_discord_notification(content)
-            print("field_changes.txt has been updated with changes in specified fields.")
-            print("Discord notification sent successfully.")
+                    if field == 'status_message':
+                        if pair_id not in alerted_fields:
+                            alerted_fields[pair_id] = {}
+                        alerted_fields[pair_id]['status_message'] = norm_new_value
 
-        # Update the fields_status file with the current statuses to prevent repeated notifications
-        sorted_pairs = sorted(current_fields_status.items())
-        with open(fields_status_file_path, "w") as file:
-            for pair_id, statuses in sorted_pairs:
-                file.write(f"{pair_id}:{','.join(f'{k}={v}' for k, v in statuses.items())}\n")
-        print("fields_status.txt has been updated.")
+    # Send Discord notification if there's content
+    if notification_content.strip():
+        send_discord_notification(notification_content)
+        changes_occurred = True
 
-    # Print results only if there are new pairs or changes in pair status or fields
-    elapsed_time = (time.time() - start_time) * 1000  # Calculate elapsed time in milliseconds
-    if new_pairs or moved_to_traded or moved_to_disabled or field_changes:
-        if new_pairs:
-            print("New pairs found:")
-            for pair in new_pairs:
-                print(f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {pair}")
-        if moved_to_traded:
-            print("Pairs Enabled:")
-            for pair in moved_to_traded:
-                print(f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {pair}")
-        if moved_to_disabled:
-            print("Pairs Disabled:")
-            for pair in moved_to_disabled:
-                print(f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {pair}")
+    # Save updated baseline and persistent alerted fields.
+    save_baseline(current_fields_status, fields_status_file_path)
+    save_alerted_fields(alerted_fields, ALERTED_FIELDS_FILE)
+
+    # Minimal console output:
+    # Only print if we actually changed pairs.txt/watchlist, or if we had changes, otherwise 1 line.
+    if wrote_pairs_txt:
+        print("pairs.txt has been updated.")
+    if wrote_watchlist_txt:
+        print("TV-Coinbase-Watchlist.txt has been updated.")
+
+    elapsed_time = (time.time() - start_time) * 1000
+    if changes_occurred or new_pairs or moved_to_traded or moved_to_disabled or wrote_pairs_txt or wrote_watchlist_txt:
+        # If something actually changed or was updated:
         if field_changes:
-            print("Field changes:")
-            for pair_id, changes_dict in field_changes.items():
-                for field, value in changes_dict.items():
-                    print(f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {pair_id} {field} changed to {value}")
+            # Print "Field changes:" only if there's actual changes we wrote
+            # The loop above might skip status_message if repeated. So let's see if any fields remain.
+            real_changes = {}
+            for pid, chdict in field_changes.items():
+                # Filter out "status_message" if we didn't actually alert it
+                filtered = {}
+                for f, val in chdict.items():
+                    if f == 'status_message':
+                        # Did we skip it? check if we alerted
+                        norm_new_value = normalize_status_message(val)
+                        old_alerted = alerted_fields.get(pid, {}).get('status_message', None)
+                        if norm_new_value != old_alerted:
+                            filtered[f] = val
+                    else:
+                        # Always include other fields
+                        filtered[f] = val
+                if filtered:
+                    real_changes[pid] = filtered
+
+            if real_changes:
+                print("Field changes:")
+                for pid, cdict in real_changes.items():
+                    for fld, val in cdict.items():
+                        if fld == 'status_message':
+                            continue  # skip flooding console for status_message
+                        print(f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {pid} {fld} changed to {val}")
+
     else:
-        print(f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - {elapsed_time:.2f} ms - No new pairs found this scan.")
+        # If truly no new changes
+        print(f"{datetime.now().strftime('%m-%d-%y %H:%M:%S')} - No new pairs or changes detected this scan.")
 
 if __name__ == "__main__":
-    fetch_usd_pairs()  # Ensure the files are created/updated on the first run
+    # First run establishes baseline.
+    fetch_usd_pairs()
     while True:
         fetch_usd_pairs()
-        time.sleep(10)  # Wait before running again
+        time.sleep(10)  # Adjust as needed.
